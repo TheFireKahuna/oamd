@@ -1,0 +1,17 @@
+[package]
+name = "oamd"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Parser for versioned Dolby Object Audio Metadata payloads"
+repository = "https://github.com/truehdd/oamd"
+readme = "README.md"
+authors = ["Rainbaby"]
+rust-version = "1.88.0"
+keywords = ["audio", "dolby", "atmos", "oamd", "metadata"]
+categories = ["multimedia::audio", "parser-implementations"]
+
+[dependencies]
+anyhow = "1.0.104"
+bitstream-io = "4.10.0"
+log = "0.4.33"

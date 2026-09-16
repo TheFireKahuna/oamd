@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+
+# Local research and handover notes, not part of the crate
+HANDOVER.md
+INPUT_FORMATS.md
