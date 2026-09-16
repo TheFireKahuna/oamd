@@ -6,7 +6,7 @@
 use std::default::Default;
 
 use crate::bitstream::SliceReader;
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use log::{trace, warn};
 
 pub const MAX_OBJECT_COUNT: usize = 159;
@@ -32,6 +32,7 @@ struct OAMDParserState {
     extended_object_element: Option<ExtendedObjectElement>,
     headphone_element: Option<HeadphoneElement>,
     object_description_element: Option<ObjectDescriptionElement>,
+    bed_object_element: Option<BedObjectElement>,
 }
 
 impl Default for OAMDParserState {
@@ -48,6 +49,7 @@ impl Default for OAMDParserState {
             extended_object_element: None,
             headphone_element: None,
             object_description_element: None,
+            bed_object_element: None,
         }
     }
 }
@@ -233,6 +235,7 @@ pub struct ObjectAudioMetadataPayload {
     pub extended_object_element: Option<ExtendedObjectElement>,
     pub headphone_element: Option<HeadphoneElement>,
     pub object_description_element: Option<ObjectDescriptionElement>,
+    pub bed_object_element: Option<BedObjectElement>,
     pub oa_element_md: Vec<OAElementMD>,
 }
 
@@ -287,6 +290,7 @@ impl ObjectAudioMetadataPayload {
             extended_object_element: state.extended_object_element.clone(),
             headphone_element: state.headphone_element.clone(),
             object_description_element: state.object_description_element.clone(),
+            bed_object_element: state.bed_object_element.clone(),
             oa_element_md,
         };
 
@@ -408,6 +412,16 @@ impl OAElementMD {
             }
             OAElementType::Headphone => {
                 state.headphone_element = Some(HeadphoneElement::read(state, reader)?);
+            }
+            OAElementType::BedObject => {
+                if state.bed_object_element.is_some() {
+                    warn!("Duplicate bed object element, keeping the first");
+                } else {
+                    match BedObjectElement::read(&state.program_assignment, reader, pos_end) {
+                        Ok(element) => state.bed_object_element = Some(element),
+                        Err(e) => warn!("Skipping malformed bed object element: {e}"),
+                    }
+                }
             }
             OAElementType::ObjectDescription => {
                 state.object_description_element =
@@ -1078,6 +1092,119 @@ impl ObjectDescriptionElement {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct DownmixRoute {
+    /// 0=front, 1=side, 2=rear surround (only for the three-way tool).
+    pub destination: u8,
+    pub gain_code: u8,
+}
+
+/// Bed object element, `oa_element_id` 6, which says how a bed folds down to fewer outputs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct BedObjectElement {
+    pub is_channels: bool,
+    /// Top front, top back, top pair, back pair, wides and LFE, derived from the
+    /// program assignment rather than read from the element.
+    pub presence: [bool; 6],
+    /// Center and surround gain codes.
+    pub loro: Option<[u8; 2]>,
+    pub ltrt: Option<[u8; 2]>,
+    pub preferred_downmix: Option<u8>,
+    pub lfe_gain: Option<u8>,
+    pub custom_downmix: bool,
+    pub wide_to_front: Option<u8>,
+    pub back4_to_back2: Option<u8>,
+    /// The top pair, top back and top front routes, in that order.
+    pub to_7_1: [Option<DownmixRoute>; 3],
+    pub to_5_1: [Option<DownmixRoute>; 3],
+    pub top4_to_top2: Option<u8>,
+}
+
+impl BedObjectElement {
+    fn read(program: &ProgramAssignment, reader: &mut SliceReader, end: u64) -> Result<Self> {
+        let mask = program.bed_assignment.iter().fold(0u32, |mask, bed| {
+            bed.0
+                .iter()
+                .enumerate()
+                .fold(mask, |m, (i, &on)| m | ((on as u32) << i))
+        });
+        let mut element = Self {
+            presence: [0x300, 0x3000, 0xc00, 0xc0, 0xc000, 0x10008].map(|m| mask & m != 0),
+            ..Self::default()
+        };
+        let mut read = |n: u32| -> Result<u8> {
+            ensure!(
+                reader.position()? + n as u64 <= end,
+                "bed object field crosses the element boundary"
+            );
+            Ok(reader.get_n::<u8>(n)?)
+        };
+        element.is_channels = read(1)? != 0;
+        if !element.is_channels {
+            return Ok(element);
+        }
+        if read(1)? != 0 {
+            element.loro = Some([read(3)?, read(3)?]);
+        }
+        if read(1)? != 0 {
+            element.ltrt = Some([read(3)?, read(3)?]);
+        }
+        // The surround code has two reserved values, unlike the center code.
+        for gains in [element.loro, element.ltrt].into_iter().flatten() {
+            if gains[1] < 2 {
+                warn!("Reserved bed object surround gain code {}", gains[1]);
+            }
+        }
+        if element.loro.is_some() || element.ltrt.is_some() {
+            element.preferred_downmix = Some(read(2)?);
+        }
+        if element.presence[5] && read(1)? != 0 {
+            element.lfe_gain = Some(read(5)?);
+        }
+        element.custom_downmix = read(1)? != 0;
+        if !element.custom_downmix {
+            return Ok(element);
+        }
+        if element.presence[4] && read(1)? != 0 {
+            element.wide_to_front = Some(read(3)?);
+        }
+        if element.presence[3] && read(1)? != 0 {
+            element.back4_to_back2 = Some(read(3)?);
+        }
+        for (i, p) in [2, 1, 0].into_iter().enumerate() {
+            if !element.presence[p] {
+                continue;
+            }
+            if read(1)? != 0 {
+                let destination = if read(1)? != 0 {
+                    0
+                } else if read(1)? != 0 {
+                    1
+                } else {
+                    2
+                };
+                element.to_7_1[i] = Some(DownmixRoute {
+                    destination,
+                    gain_code: read(3)?,
+                });
+            }
+            if read(1)? != 0 {
+                let destination = if read(1)? != 0 { 0 } else { 1 };
+                element.to_5_1[i] = Some(DownmixRoute {
+                    destination,
+                    gain_code: read(3)?,
+                });
+            }
+        }
+        if (element.presence[0] || element.presence[1]) && read(1)? != 0 {
+            element.top4_to_top2 = Some(read(3)?);
+        }
+        Ok(element)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 #[repr(C)]
 pub struct TrimElement {
@@ -1635,6 +1762,12 @@ const TEST_DATA_TRIM: &[u8] = &[
 ];
 
 #[cfg(test)]
+const TEST_DATA_BED_OBJECT: &[u8] = &[
+    0x12, 0x11, 0x2b, 0xc4, 0x30, 0, 0x0f, 0xf1, 0x08, 0x42, 0x10, 0x84, 0x21, 0x08, 0x62, 0x22,
+    0x8b, 0x32, 0,
+];
+
+#[cfg(test)]
 const TEST_DATA_BROKEN: &[u8] = &[
     0x1F, 0x88, 0x4B, 0x80, 0x00, 0xA2, 0x70, 0x00, 0x80, 0x40, 0xE4, 0x0B, 0x40, 0x81, 0xDF, 0x02,
     0x01, 0x03, 0x80, 0xFC, 0x02, 0x07, 0xD4, 0x5A, 0x04, 0x0F, 0xF0, 0x10, 0x08, 0x1C, 0x0F, 0xA0,
@@ -1646,6 +1779,54 @@ const TEST_DATA_BROKEN: &[u8] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bed_object() {
+        let payload = ObjectAudioMetadataPayload::read(TEST_DATA_BED_OBJECT).unwrap();
+        let parsed = payload.bed_object_element.as_ref().unwrap();
+        assert_eq!(parsed.presence, [true, true, false, false, false, true]);
+        assert_eq!(parsed.top4_to_top2, Some(1));
+        assert_eq!(
+            parsed.to_5_1[1],
+            Some(DownmixRoute {
+                destination: 1,
+                gain_code: 1
+            })
+        );
+        assert_eq!(
+            parsed.to_5_1[2],
+            Some(DownmixRoute {
+                destination: 0,
+                gain_code: 1
+            })
+        );
+
+        // No end short of the real one may be read past.
+        for end in 122..143 {
+            let mut reader = SliceReader::new(TEST_DATA_BED_OBJECT);
+            reader.skip_n(122).unwrap();
+            assert!(BedObjectElement::read(&payload.program_assignment, &mut reader, end).is_err());
+            assert!(reader.position().unwrap() <= end);
+        }
+
+        let mut reader = SliceReader::new(TEST_DATA_BED_OBJECT);
+        reader.skip_n(122).unwrap();
+        assert_eq!(
+            &BedObjectElement::read(&payload.program_assignment, &mut reader, 143).unwrap(),
+            parsed
+        );
+        assert_eq!(reader.position().unwrap(), 143);
+    }
+
+    /// A malformed element is skipped, not fatal: the parser realigns to its boundary.
+    #[test]
+    fn bed_object_truncated() {
+        for len in 16..TEST_DATA_BED_OBJECT.len() {
+            let payload = ObjectAudioMetadataPayload::read(&TEST_DATA_BED_OBJECT[..len])
+                .unwrap_or_else(|e| panic!("length {len}: {e}"));
+            assert!(payload.bed_object_element.is_none(), "length {len}");
+        }
+    }
     use anyhow::Result;
 
     #[test]
