@@ -6,7 +6,7 @@
 use std::default::Default;
 
 use crate::bitstream::SliceReader;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use log::{trace, warn};
 
 pub const MAX_OBJECT_COUNT: usize = 159;
@@ -251,9 +251,15 @@ impl ObjectAudioMetadataPayload {
             oamd_version += reader.get_n::<u8>(3)?;
         }
 
-        // Field layout below is only defined for version 0.
+        // Field layout below is only defined for version 0. A payload of another version is
+        // returned without elements, not as an error: the access unit carrying it still decodes,
+        // and its objects keep the metadata they had.
         if oamd_version != 0 {
-            bail!("unsupported OAMD version {oamd_version}");
+            warn!("OAMD version {oamd_version} is not read; its payload is skipped");
+            return Ok(Self {
+                oamd_version,
+                ..Default::default()
+            });
         }
 
         let mut object_count_bits = reader.get_n::<u8>(5)?;
@@ -421,6 +427,24 @@ impl OAElementMD {
         };
 
         match element_type {
+            // An element type the payload has already given is a duplicate: TS 103 420 tells
+            // elements of one type apart only by alternate_object_data_id (table 27), and those
+            // already left with a non-zero one. The first stands, as for the bed object element.
+            OAElementType::Object if state.object_element.is_some() => {
+                warn!("Duplicate object element, keeping the first")
+            }
+            OAElementType::Trim if state.trim_element.is_some() => {
+                warn!("Duplicate trim element, keeping the first")
+            }
+            OAElementType::ExtendObject if state.extended_object_element.is_some() => {
+                warn!("Duplicate extended object element, keeping the first")
+            }
+            OAElementType::Headphone if state.headphone_element.is_some() => {
+                warn!("Duplicate headphone element, keeping the first")
+            }
+            OAElementType::ObjectDescription if state.object_description_element.is_some() => {
+                warn!("Duplicate object description element, keeping the first")
+            }
             OAElementType::Object => {
                 let object_element = ObjectElement::read(state, reader)?;
                 state.object_element = Some(object_element);
@@ -2132,6 +2156,56 @@ mod tests {
         b.push(2, depth_idx);
         b.push(1, 0); // b_object_snap
         b.push(1, 0); // b_additional_table_data_exists
+    }
+
+    /// A version this parser cannot read is skipped, not an error that would fail its access unit.
+    #[test]
+    fn other_versions_are_skipped() -> Result<()> {
+        let mut bits = Bits::default();
+        bits.push(2, 1); // oamd_version 1
+        bits.push(6, 0);
+        let payload = ObjectAudioMetadataPayload::read(&bits.data)?;
+        assert_eq!(payload.oamd_version, 1);
+        assert!(payload.object_element.is_none() && payload.oa_element_md.is_empty());
+        Ok(())
+    }
+
+    /// A second element of a type already read is skipped by its size; the first stands.
+    #[test]
+    fn duplicate_elements_keep_the_first() -> Result<()> {
+        let element = |depth_idx: u32| {
+            let mut b = Bits::default();
+            object_element_header(&mut b, 0, 1);
+            first_block(&mut b, 0, 0, 0, depth_idx);
+            b
+        };
+        let (first, second) = (element(3), element(0));
+        let mut bits = Bits::default();
+        bits.push(2, 0); // oamd_version
+        bits.push(5, 0); // object_count - 1
+        bits.push(1, 1); // b_dyn_object_only_program
+        bits.push(1, 0); // b_lfe_present
+        bits.push(1, 0); // b_alternate_object_data_present
+        bits.push(4, 2); // oa_element_count
+        for body in [&first, &second] {
+            let bytes = (body.len + 1).div_ceil(8);
+            bits.push(4, 1); // oa_element_id_idx: object element
+            bits.push(4, (bytes - 1) as u32);
+            bits.push(1, 0);
+            let start = bits.len;
+            bits.push(1, 0); // b_discard_unknown_element
+            for i in 0..body.len {
+                bits.push(1, ((body.data[i / 8] >> (7 - (i % 8))) & 1) as u32);
+            }
+            while bits.len < start + 8 * bytes {
+                bits.push(1, 0); // padding
+            }
+        }
+        let payload = ObjectAudioMetadataPayload::read(&bits.data)?;
+        assert_eq!(payload.oa_element_md.len(), 2);
+        let first = payload.object_element.unwrap();
+        assert_eq!(first.object_data[0][0].object_render_info.depth_factor, 2.0);
+        Ok(())
     }
 
     /// Table 16 depth factors, table 20's reserved zone 6, table 22's reserved sample offset code.
