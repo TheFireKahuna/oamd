@@ -38,18 +38,26 @@ impl<'a> SliceReader<'a> {
     }
 
     /// A value split into `n`-bit groups, each followed by a bit saying whether another
-    /// group follows, up to `max_num_groups`.
+    /// group follows: TS 103 420 5.5.1, step for step. Its loop reads a group before it tests the
+    /// count, so with `max_num_groups` > 1 a stream can carry one group more than the maximum.
     pub(crate) fn get_variable_bits_max(&mut self, n: u32, max_num_groups: u32) -> io::Result<u32> {
-        let mut value = 0;
-        let mut groups = 0;
-        let mut more = true;
-
-        while more && groups < max_num_groups {
-            value += self.get_n::<u32>(n)?;
-            more = self.get()?;
+        let mut num_group = 1;
+        let mut value = self.get_n::<u32>(n)?;
+        let mut more = self.get()?;
+        if max_num_groups > num_group {
             if more {
-                value = (value + 1) << n;
-                groups += 1;
+                value = (value << n) + (1 << n);
+            }
+            while more {
+                value += self.get_n::<u32>(n)?;
+                more = self.get()?;
+                if num_group >= max_num_groups {
+                    break;
+                }
+                if more {
+                    value = (value << n) + (1 << n);
+                    num_group += 1;
+                }
             }
         }
 

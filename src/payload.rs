@@ -21,8 +21,8 @@ struct OAMDParserState {
     program_assignment: ProgramAssignment,
     b_alternate_object_data_present: bool,
 
-    /// Predictor for `object_gain_code == 0b11`, holding the last gain decoded at
-    /// each block index (i.e. the previous object's gain at that block).
+    /// Predictor for `object_gain_code == 0b11`: the gain of the last object read, at each
+    /// block index (i.e. the previous object's gain at that block).
     prev_object_gain: [i8; MAX_OBJ_INFO_BLOCKS],
     prev_object_basic_info: ObjectBasicInfo,
     prev_object_render_info: ObjectRenderInfo,
@@ -138,7 +138,8 @@ pub struct ProgramAssignment {
 
 impl ProgramAssignment {
     pub fn b_dyn_object_only_program(&self) -> bool {
-        self.num_bed_objects <= 1 && self.num_dynamic_objects == 0 && self.num_isf_objects > 0
+        // TS 103 420 5.6.0.5: dynamic objects plus at most an LFE, nothing else.
+        self.num_bed_objects <= 1 && self.num_isf_objects == 0 && self.num_dynamic_objects > 0
     }
 
     pub fn beds_or_isf_count(&self) -> usize {
@@ -275,9 +276,18 @@ impl ObjectAudioMetadataPayload {
             oa_element_count += reader.get_n::<u8>(5)?;
         }
 
-        let oa_element_md = (0..oa_element_count)
-            .map(|_| OAElementMD::read(state, reader))
-            .collect::<Result<Vec<_>>>()?;
+        let mut oa_element_md = Vec::with_capacity(oa_element_count as usize);
+        for _ in 0..oa_element_count {
+            // A truncated element is read up to the end of the payload; the ones after it are lost.
+            if reader.available()? == 0 {
+                warn!(
+                    "OAMD payload ends before its last {} elements",
+                    oa_element_count as usize - oa_element_md.len()
+                );
+                break;
+            }
+            oa_element_md.push(OAElementMD::read(state, reader)?);
+        }
 
         let payload = Self {
             evo_sample_offset: 0,
@@ -386,7 +396,7 @@ impl OAElementMD {
         let pos_end = if oa_element_size > reader.available()? {
             // Does this happen?
             warn!("Truncated oa_element_md with id {}", md.oa_element_id_idx);
-            reader.available()?
+            pos_start + reader.available()?
         } else {
             pos_start + oa_element_size
         };
@@ -397,7 +407,20 @@ impl OAElementMD {
 
         md.b_discard_unknown_element = reader.get()?;
 
-        match OAElementType::from_u8(md.oa_element_id_idx) {
+        // TS 103 420 table 27: 0 is the element itself; 1-15 are alternative data of a kind no
+        // version defines yet, which must not replace it.
+        let element_type = match md.alternate_object_data_id_idx {
+            Some(id) if id != 0 => {
+                warn!(
+                    "Skipping oa_element {} with reserved alternate data id {id}",
+                    md.oa_element_id_idx
+                );
+                OAElementType::Reserved(md.oa_element_id_idx)
+            }
+            _ => OAElementType::from_u8(md.oa_element_id_idx),
+        };
+
+        match element_type {
             OAElementType::Object => {
                 let object_element = ObjectElement::read(state, reader)?;
                 state.object_element = Some(object_element);
@@ -427,6 +450,7 @@ impl OAElementMD {
                 state.object_description_element =
                     Some(ObjectDescriptionElement::read(state, reader)?);
             }
+            _ if md.alternate_object_data_id_idx.is_some_and(|id| id != 0) => {}
             _ => {
                 warn!(
                     "Unimplemented oa_element_md type {} with size={oa_element_size}, pos_end={pos_end}, please submit a sample",
@@ -528,8 +552,8 @@ impl MDUpdateInfo {
             },
             // sample_offset_bits
             2 => reader.get_n::<u8>(5)? as usize,
-            // 3 => // reserved
-            _ => unreachable!(),
+            // reserved (table 22): nothing follows, and there is no offset
+            _ => 0,
         };
 
         let num_obj_info_blocks = (reader.get_n::<u8>(3)? + 1) as usize;
@@ -638,6 +662,9 @@ impl ObjectInfoBlock {
         };
 
         state.prev_object_basic_info = info.object_basic_info.clone();
+        // Table 18's object_gain_idx 3 means the previous object's gain in this block, whichever
+        // way that object's gain was arrived at.
+        state.prev_object_gain[block_index] = info.object_basic_info.object_gain;
 
         info.b_object_in_bed_or_isf = object_index < state.program_assignment.beds_or_isf_count();
 
@@ -746,8 +773,6 @@ impl ObjectBasicInfo {
                 3 => prev_object_gain,
                 _ => unreachable!(),
             };
-
-            state.prev_object_gain[block_index] = basic.object_gain;
         }
 
         if obj_basic_info_bits & 2 != 0 {
@@ -767,7 +792,12 @@ impl ObjectBasicInfo {
 #[repr(C)]
 pub struct ObjectRenderInfo {
     pub b_differential_position_specified: bool,
+    /// Standard-precision position, unclamped: TS 103 420 5.6.1.1.8-14 clamp once, after the
+    /// extended precision refinement is added, so whoever adds it clamps.
     pub pos3d: [f64; 3],
+    /// The standard-precision codes behind `pos3d` (x and y in 62nds, z signed in 15ths), which
+    /// the next block's differential position applies to.
+    pub pos3d_code: [i32; 3],
     pub b_object_distance_specified: bool,
     /// Object distance in metres, resolved from [`DISTANCE_FACTORS`] at parse
     /// time. `None` when unspecified, `f64::INFINITY` for objects at infinity.
@@ -786,6 +816,7 @@ impl Default for ObjectRenderInfo {
         Self {
             b_differential_position_specified: false,
             pos3d: [0.5, 0.5, 0.0],
+            pos3d_code: [31, 31, 0],
             b_object_distance_specified: false,
             distance_factor: None,
             zone_constraints_idx: 0,
@@ -820,27 +851,21 @@ impl ObjectRenderInfo {
                 reader.get()?
             };
 
-            let [x, y, z] = if render.b_differential_position_specified {
-                let (prev_x, prev_y, prev_z) = (prev.pos3d[0], prev.pos3d[1], prev.pos3d[2]);
-
-                let x = prev_x + reader.get_s::<i8>(3)? as f64 / 62.0;
-                let y = prev_y + reader.get_s::<i8>(3)? as f64 / 62.0;
-                let z = prev_z + reader.get_s::<i8>(3)? as f64 / 15.0;
-
-                [x, y, z]
+            render.pos3d_code = if render.b_differential_position_specified {
+                let [x, y, z] = prev.pos3d_code;
+                [
+                    x + reader.get_s::<i8>(3)? as i32,
+                    y + reader.get_s::<i8>(3)? as i32,
+                    z + reader.get_s::<i8>(3)? as i32,
+                ]
             } else {
-                let x = reader.get_n::<u64>(6)? as f64 / 62.0;
-                let y = reader.get_n::<u64>(6)? as f64 / 62.0;
-
-                let sign_z = if reader.get()? { 1.0 } else { -1.0 };
-                let z = reader.get_n::<u64>(4)? as f64 / 15.0 * sign_z;
-
-                [x, y, z]
+                let x = reader.get_n::<u8>(6)? as i32;
+                let y = reader.get_n::<u8>(6)? as i32;
+                let sign_z = if reader.get()? { 1 } else { -1 };
+                [x, y, sign_z * reader.get_n::<u8>(4)? as i32]
             };
-
-            // Each coordinate is a code clamped to its own range, and it is the clamped code
-            // the next block's differential applies to.
-            render.pos3d = [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0), z.clamp(-1.0, 1.0)];
+            let [x, y, z] = render.pos3d_code;
+            render.pos3d = [x as f64 / 62.0, y as f64 / 62.0, z as f64 / 15.0];
 
             render.b_object_distance_specified = reader.get()?;
 
@@ -858,9 +883,9 @@ impl ObjectRenderInfo {
         }
 
         if object_render_info_bits & 2 != 0 {
-            // 7 is not a zone constraint; it is read and stored as 0.
+            // 6 and 7 are reserved (table 20); they are read and stored as 0, no constraint.
             render.zone_constraints_idx = match reader.get_n(3)? {
-                7 => 0,
+                6 | 7 => 0,
                 idx => idx,
             };
             render.b_enable_elevation = reader.get()?;
@@ -890,7 +915,7 @@ impl ObjectRenderInfo {
 
             if render.b_object_use_screen_ref {
                 render.screen_factor = (reader.get_n::<u8>(3)? + 1) as f64 / 8.0;
-                render.depth_factor = 0.25 * (reader.get_n::<u8>(2)? + 1) as f64;
+                render.depth_factor = DEPTH_FACTORS[reader.get_n::<u8>(2)? as usize];
             } else {
                 render.screen_factor = 0.0
             }
@@ -910,9 +935,21 @@ pub const DISTANCE_FACTORS: [f64; 16] = [
     1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 7.9, 10.0, 12.6, 15.8, 20.0, 25.1, 50.1,
 ];
 
+/// Maps a 2-bit depth_factor_idx to depth_factor (TS 103 420 table 16).
+pub const DEPTH_FACTORS: [f64; 4] = [0.25, 0.5, 1.0, 2.0];
+
+/// trim_centre in dB (TS 103 420 table 35). Code 14 is -15 dB as oamd 0.1.0 has it (Q12 0x02d8),
+/// not the table's -16; -15 continues the table's 1.5 dB steps.
 #[rustfmt::skip]
 pub const TRIM_LUT: [f64; 16] = [
     6.0, 3.0, 1.5, 0.75, -0.75, -1.5, -3.0, -4.5, -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -15.0, -36.0,
+];
+
+/// trim_surround and trim_height in dB (tables 36 and 37): codes 0-3 are reserved, None.
+#[rustfmt::skip]
+pub const TRIM_ATTENUATION_LUT: [Option<f64>; 16] = [
+    None, None, None, None, Some(-0.75), Some(-1.5), Some(-3.0), Some(-4.5), Some(-6.0), Some(-7.5),
+    Some(-9.0), Some(-10.5), Some(-12.0), Some(-13.5), Some(-15.0), Some(-36.0),
 ];
 
 // TODO: TrimElement & ExtendObjectElement
@@ -1275,11 +1312,11 @@ impl TrimElement {
                     }
 
                     if trim_balance_presence & 0x2 != 0 {
-                        t.trim_surround = Some(TRIM_LUT[reader.get_n::<u8>(4)? as usize]);
+                        t.trim_surround = TRIM_ATTENUATION_LUT[reader.get_n::<u8>(4)? as usize];
                     }
 
                     if trim_balance_presence & 0x4 != 0 {
-                        t.trim_height = Some(TRIM_LUT[reader.get_n::<u8>(4)? as usize]);
+                        t.trim_height = TRIM_ATTENUATION_LUT[reader.get_n::<u8>(4)? as usize];
                     }
 
                     if trim_balance_presence & 0x8 != 0 {
@@ -1348,21 +1385,20 @@ impl ExtendedObjectElement {
                         blk.b_object_divergence = reader.get()?;
 
                         if blk.b_object_divergence {
-                            // object_div_mode
-                            match reader.get_n::<u8>(2)? {
+                            let object_div_mode = reader.get_n::<u8>(2)?;
+                            match object_div_mode {
                                 0 => {
                                     blk.object_divergence =
                                         // object_div_table
                                         ObjectDivergenceBlock::OBJECT_DIV_TABLE_TABLE
                                             [reader.get_n::<u8>(2)? as usize];
                                 }
+                                // Reuse the previous block's value. At block 0 that block is
+                                // the previous payload's last, which only the caller has:
+                                // object_div_mode 1 with no value tells it to carry its own.
                                 1 => {
                                     if let Some(prev_blk) = blk_blk.last().cloned() {
                                         blk = prev_blk;
-                                    } else {
-                                        warn!(
-                                            "No previous block for object {object_index} block {block_index}"
-                                        );
                                     }
                                 }
                                 _ => {
@@ -1378,6 +1414,8 @@ impl ExtendedObjectElement {
                                     }
                                 }
                             }
+                            blk.b_object_divergence = true;
+                            blk.object_div_mode = object_div_mode;
                         }
                     }
 
@@ -1818,13 +1856,20 @@ mod tests {
         assert_eq!(reader.position().unwrap(), 143);
     }
 
-    /// A malformed element is skipped, not fatal: the parser realigns to its boundary.
+    /// A truncated element is not fatal: it is either dropped or, when only its padding was cut
+    /// off, read in full.
     #[test]
     fn bed_object_truncated() {
+        let full = ObjectAudioMetadataPayload::read(TEST_DATA_BED_OBJECT)
+            .unwrap()
+            .bed_object_element;
         for len in 16..TEST_DATA_BED_OBJECT.len() {
             let payload = ObjectAudioMetadataPayload::read(&TEST_DATA_BED_OBJECT[..len])
                 .unwrap_or_else(|e| panic!("length {len}: {e}"));
-            assert!(payload.bed_object_element.is_none(), "length {len}");
+            assert!(
+                payload.bed_object_element.is_none() || payload.bed_object_element == full,
+                "length {len}"
+            );
         }
     }
     use anyhow::Result;
@@ -1874,12 +1919,17 @@ mod tests {
     /// A payload carrying one element and nothing else: one dynamic object, no bed.
     /// `body` writes the element's own bits, after the id, size and discard flag.
     fn payload_with_element(id: u32, body: impl Fn(&mut Bits)) -> Vec<u8> {
+        payload_with_objects(1, id, body)
+    }
+
+    /// `payload_with_element` with `objects` dynamic objects.
+    fn payload_with_objects(objects: u32, id: u32, body: impl Fn(&mut Bits)) -> Vec<u8> {
         let mut element = Bits::default();
         body(&mut element);
 
         let mut bits = Bits::default();
         bits.push(2, 0); // oamd_version
-        bits.push(5, 0); // object_count - 1
+        bits.push(5, objects - 1); // object_count - 1
         bits.push(1, 1); // b_dyn_object_only_program
         bits.push(1, 0); // b_lfe_present
         bits.push(1, 0); // b_alternate_object_data_present
@@ -2049,10 +2099,138 @@ mod tests {
         Ok(())
     }
 
+    /// md_update_info with one block at offset 0 and no ramp, and the element's reserved flag.
+    fn object_element_header(b: &mut Bits, sample_offset_code: u32, blocks: u32) {
+        b.push(2, sample_offset_code);
+        b.push(3, blocks - 1);
+        for _ in 0..blocks {
+            b.push(6, 0); // block_offset_factor_bits
+            b.push(2, 0); // ramp_duration_code
+        }
+        b.push(1, 1); // b_reserved_data_not_present
+    }
+
+    /// Block 0 of an active object: gain as coded, default priority, position (0, 0, +0), the
+    /// zone code, size 0, screen reference with `depth_idx`, no snap, no additional data.
+    fn first_block(b: &mut Bits, gain_code: u32, gain_bits: u32, zone: u32, depth_idx: u32) {
+        b.push(1, 0); // b_object_not_active
+        b.push(2, gain_code);
+        if gain_code == 2 {
+            b.push(6, gain_bits);
+        }
+        b.push(1, 1); // b_default_object_priority
+        b.push(6, 0);
+        b.push(6, 0);
+        b.push(1, 1); // pos3D_Z_sign_bits
+        b.push(4, 0);
+        b.push(1, 0); // b_object_distance_specified
+        b.push(3, zone);
+        b.push(1, 1); // b_enable_elevation
+        b.push(2, 0); // object_size_idx
+        b.push(1, 1); // b_object_use_screen_ref
+        b.push(3, 7); // screen_factor_bits
+        b.push(2, depth_idx);
+        b.push(1, 0); // b_object_snap
+        b.push(1, 0); // b_additional_table_data_exists
+    }
+
+    /// Table 16 depth factors, table 20's reserved zone 6, table 22's reserved sample offset code.
+    #[test]
+    fn render_info_tables() -> Result<()> {
+        for (depth_idx, depth) in [(0, 0.25), (1, 0.5), (2, 1.0), (3, 2.0)] {
+            let data = payload_with_element(1, |b| {
+                object_element_header(b, 3, 1);
+                first_block(b, 0, 0, 6, depth_idx);
+            });
+            let element = ObjectAudioMetadataPayload::read(&data)?
+                .object_element
+                .unwrap();
+            assert_eq!(element.md_update_info.sample_offset, 0);
+            let render = &element.object_data[0][0].object_render_info;
+            assert_eq!(render.depth_factor, depth);
+            assert_eq!(render.screen_factor, 1.0);
+            assert_eq!(render.zone_constraints_idx, 0);
+        }
+        Ok(())
+    }
+
+    /// object_gain_idx 3 takes the previous object's gain in the block however that object got
+    /// it, here by reusing its own from the block before (status 2).
+    #[test]
+    fn gain_of_previous_object() -> Result<()> {
+        let data = payload_with_objects(2, 1, |b| {
+            object_element_header(b, 0, 2);
+            first_block(b, 2, 9, 0, 0); // object 0, block 0: +6 dB
+            b.push(1, 0); // object 0, block 1: active
+            b.push(2, 2); // basic info: as block 0
+            b.push(2, 2); // render info: as block 0
+            b.push(1, 0); // b_additional_table_data_exists
+            first_block(b, 3, 0, 0, 0); // object 1, block 0: object 0's gain
+            b.push(1, 0); // object 1, block 1: active
+            b.push(2, 1); // basic info: all of it
+            b.push(2, 3); // object_gain_idx: object 0's gain in this block
+            b.push(1, 1); // b_default_object_priority
+            b.push(2, 2); // render info: as block 0
+            b.push(1, 0); // b_additional_table_data_exists
+        });
+        let element = ObjectAudioMetadataPayload::read(&data)?
+            .object_element
+            .unwrap();
+        let gains: Vec<Vec<i8>> = element
+            .object_data
+            .iter()
+            .map(|o| o.iter().map(|b| b.object_basic_info.object_gain).collect())
+            .collect();
+        assert_eq!(gains, vec![vec![6, 6], vec![6, 6]]);
+        Ok(())
+    }
+
+    /// TS 103 420 5.5.1 read literally: (v + 1) << n per extra group, and one group past the
+    /// maximum when the stream asks for it.
+    #[test]
+    fn variable_bits_max_groups() {
+        let mut bits = Bits::default();
+        bits.push(4, 0xF);
+        bits.push(1, 0);
+        assert_eq!(
+            SliceReader::new(&bits.data)
+                .get_variable_bits_max(4, 4)
+                .unwrap(),
+            0xF
+        );
+
+        let mut bits = Bits::default();
+        bits.push(4, 1);
+        bits.push(1, 1);
+        bits.push(4, 2);
+        bits.push(1, 0);
+        assert_eq!(
+            SliceReader::new(&bits.data)
+                .get_variable_bits_max(4, 4)
+                .unwrap(),
+            ((1 + 1) << 4) + 2
+        );
+
+        let mut bits = Bits::default();
+        for group in 0..5 {
+            bits.push(4, 0);
+            bits.push(1, (group < 4) as u32);
+        }
+        let mut reader = SliceReader::new(&bits.data);
+        let mut expected = 0;
+        for _ in 0..4 {
+            expected = (expected << 4) + (1 << 4);
+        }
+        assert_eq!(reader.get_variable_bits_max(4, 4).unwrap(), expected);
+        assert_eq!(reader.position().unwrap(), 25);
+    }
+
     #[test]
     fn trim_lut_values() {
         // Trim index 14 is -15.0 dB (Q12 0x02d8)
         assert_eq!(TRIM_LUT[14], -15.0);
+        assert_eq!(TRIM_ATTENUATION_LUT[14], Some(-15.0));
+        assert!(TRIM_ATTENUATION_LUT[..4].iter().all(Option::is_none));
         // -1.5 dB step progression from index 7 through 14
         for i in 7..14 {
             assert_eq!(TRIM_LUT[i] - TRIM_LUT[i + 1], 1.5);
