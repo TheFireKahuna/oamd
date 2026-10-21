@@ -1100,8 +1100,14 @@ pub struct ObjectDescriptionElement {
     pub num_obj_info_blocks: usize,
     pub b_present: bool,
     pub sub_mode: u8,
-    /// Indexed by object, then by block. Empty where the element states nothing.
+    /// Indexed by object, then by block. Empty where the element states nothing. Sub-mode 0's one
+    /// bit gives 1 when set and 2 when clear: 1 is dialogue, 2 is not. 3 comes with the five bits of
+    /// `object_dialog_extra`; 0 states nothing.
     pub object_dialog_indication: Vec<Vec<u8>>,
+    /// The five bits sub-mode 1 carries after indication 3 when its extra flag is set, indexed like
+    /// `object_dialog_indication`; `None` where there are none. Their meaning is not known (AC-4,
+    /// which carries the same metadata otherwise, caps dialogue enhancement with a signalled gain).
+    pub object_dialog_extra: Vec<Vec<Option<u8>>>,
 }
 
 impl ObjectDescriptionElement {
@@ -1133,20 +1139,24 @@ impl ObjectDescriptionElement {
             }
             1 => {
                 let b_extra = reader.get()?;
+                let mut extra = Vec::with_capacity(objects * blocks);
                 element.object_dialog_indication = Self::per_object(
                     objects,
                     blocks,
                     |r| {
                         let code = r.get_n::<u8>(2)? as usize;
-                        // Only that one code carries the five further bits, whose meaning is
-                        // not stated anywhere this was read from.
-                        if code == 2 && b_extra {
-                            r.skip_n(5)?;
-                        }
+                        // Only that one code carries the five further bits.
+                        extra.push(if code == 2 && b_extra {
+                            Some(r.get_n::<u8>(5)?)
+                        } else {
+                            None
+                        });
                         Ok(Self::DIALOG_MAP[code])
                     },
                     reader,
                 )?;
+                element.object_dialog_extra =
+                    extra.chunks(blocks.max(1)).map(<[_]>::to_vec).collect();
             }
             // Reserved data rather than indications, so every object reads as 0.
             _ => {
@@ -2136,6 +2146,7 @@ mod tests {
             .expect("an object description element");
 
         assert_eq!(element.object_dialog_indication, vec![vec![3, 0]]);
+        assert_eq!(element.object_dialog_extra, vec![vec![Some(0x15), None]]);
 
         Ok(())
     }
