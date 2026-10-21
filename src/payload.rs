@@ -1002,7 +1002,8 @@ pub const TRIM_ATTENUATION_LUT: [Option<f64>; 16] = [
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct HeadphoneBlock {
-    /// 0, 1 or 2. Values above 2 are not defined and are read as 2.
+    /// 0 bypass (stereo), 1 near, 2 far, 3 mid: AC-4's hp_render_mode_obj (TS 103 190-2
+    /// V1.3.1 table 121), the same element in that codec. TS 103 420 leaves element 3 reserved.
     pub hp_render_mode: u8,
     pub hp_head_track_disable: bool,
 }
@@ -1081,7 +1082,7 @@ impl HeadphoneElement {
             let mut object = Vec::with_capacity(blocks);
             for _ in 0..blocks {
                 object.push(HeadphoneBlock {
-                    hp_render_mode: reader.get_n::<u8>(2)?.min(2),
+                    hp_render_mode: reader.get_n::<u8>(2)?,
                     hp_head_track_disable: reader.get()?,
                 });
             }
@@ -2062,7 +2063,7 @@ mod tests {
             b.push(3, 1); // two blocks
             b.push(2, 2); // block 0 render mode
             b.push(1, 1); // block 0 head track disable
-            b.push(2, 3); // block 1 render mode, above the defined range
+            b.push(2, 3); // block 1 render mode: mid
             b.push(1, 0);
         });
 
@@ -2072,8 +2073,7 @@ mod tests {
 
         assert_eq!(element.headphone_data[0][0].hp_render_mode, 2);
         assert!(element.headphone_data[0][0].hp_head_track_disable);
-        // Only three modes are defined, and a fourth code reads as the highest.
-        assert_eq!(element.headphone_data[0][1].hp_render_mode, 2);
+        assert_eq!(element.headphone_data[0][1].hp_render_mode, 3);
         assert!(!element.headphone_data[0][1].hp_head_track_disable);
 
         Ok(())
