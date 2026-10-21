@@ -74,6 +74,22 @@ impl<'a> SliceReader<'a> {
         self.bits.position_in_bits()
     }
 
+    /// The next `n` bits as bytes of their own, left-aligned, for a reader that cannot run past them.
+    pub(crate) fn take(&mut self, n: u64) -> io::Result<Vec<u8>> {
+        if n > self.available()? {
+            return Err(self.out_of_bounds(n.min(u32::MAX as u64) as u32, "take"));
+        }
+        let mut bytes = Vec::with_capacity(n.div_ceil(8) as usize);
+        for _ in 0..n / 8 {
+            bytes.push(self.bits.read_unsigned_var::<u8>(8)?);
+        }
+        let rest = (n % 8) as u32;
+        if rest > 0 {
+            bytes.push(self.bits.read_unsigned_var::<u8>(rest)? << (8 - rest));
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn skip_n(&mut self, n: u32) -> io::Result<()> {
         // bitstream-io reports EOF itself for a short skip, so only a long one is worth checking
         if n <= 64 {

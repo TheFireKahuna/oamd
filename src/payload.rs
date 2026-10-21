@@ -6,7 +6,7 @@
 use std::default::Default;
 
 use crate::bitstream::SliceReader;
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use log::{trace, warn};
 
 pub const MAX_OBJECT_COUNT: usize = 159;
@@ -283,7 +283,7 @@ impl ObjectAudioMetadataPayload {
         }
 
         let mut oa_element_md = Vec::with_capacity(oa_element_count as usize);
-        for _ in 0..oa_element_count {
+        for index in 0..oa_element_count {
             // A truncated element is read up to the end of the payload; the ones after it are lost.
             if reader.available()? == 0 {
                 warn!(
@@ -292,7 +292,11 @@ impl ObjectAudioMetadataPayload {
                 );
                 break;
             }
-            oa_element_md.push(OAElementMD::read(state, reader)?);
+            oa_element_md.push(OAElementMD::read(
+                state,
+                reader,
+                index + 1 == oa_element_count,
+            )?);
         }
 
         let payload = Self {
@@ -389,47 +393,78 @@ impl OAElementType {
 }
 
 impl OAElementMD {
-    fn read(state: &mut OAMDParserState, reader: &mut SliceReader) -> Result<Self> {
-        let mut md = OAElementMD {
-            oa_element_id_idx: reader.get_n::<u8>(4)?,
-            ..Default::default()
-        };
-
+    /// One element (TS 103 420 5.5.5). Its declared size is where the next element starts
+    /// (5.6.4.3), so an element with one after it is read from that size alone: one whose fields run
+    /// past it is malformed and dropped, and the next element still starts where the size says, as
+    /// do elements of a type this parser does not read. The `last` element has nothing after it for
+    /// its size to place, and is read up to the end of the payload: some TrueHD encoders declare the
+    /// programme's first object element shorter than the fields they write, and its objects are all
+    /// there.
+    fn read(state: &mut OAMDParserState, reader: &mut SliceReader, last: bool) -> Result<Self> {
+        let oa_element_id_idx = reader.get_n::<u8>(4)?;
         let oa_element_size_bits = reader.get_variable_bits_max(4, 4)? as u64;
         let oa_element_size = (oa_element_size_bits + 1) << 3;
 
-        let pos_start = reader.position()?;
-        let pos_end = if oa_element_size > reader.available()? {
-            // Does this happen?
-            warn!("Truncated oa_element_md with id {}", md.oa_element_id_idx);
-            pos_start + reader.available()?
+        let available = reader.available()?;
+        if oa_element_size > available {
+            warn!(
+                "oa_element {oa_element_id_idx} declares {oa_element_size} bits, {available} remain; read to the end of the payload"
+            );
+        }
+        let body = reader.take(if last {
+            available
         } else {
-            pos_start + oa_element_size
-        };
+            oa_element_size.min(available)
+        })?;
+        let element_reader = &mut SliceReader::new(&body);
 
-        if state.b_alternate_object_data_present {
-            md.alternate_object_data_id_idx = Some(reader.get_n::<u8>(4)?);
+        let mut md = OAElementMD {
+            oa_element_id_idx,
+            ..Default::default()
+        };
+        if let Err(e) = md.read_body(state, element_reader) {
+            warn!("Dropping oa_element {oa_element_id_idx}: {e}");
+        } else if element_reader.position()? > oa_element_size {
+            warn!(
+                "oa_element {oa_element_id_idx} declares {oa_element_size} bits and takes {}; the last element, read to the end of the payload",
+                element_reader.position()?
+            );
         }
 
-        md.b_discard_unknown_element = reader.get()?;
+        trace!(
+            "OAMD Element ID: {}, size: {}, read: {}",
+            md.oa_element_id_idx,
+            oa_element_size,
+            element_reader.position().unwrap_or(0)
+        );
+
+        Ok(md)
+    }
+
+    fn read_body(&mut self, state: &mut OAMDParserState, reader: &mut SliceReader) -> Result<()> {
+        if state.b_alternate_object_data_present {
+            self.alternate_object_data_id_idx = Some(reader.get_n::<u8>(4)?);
+        }
+
+        self.b_discard_unknown_element = reader.get()?;
 
         // TS 103 420 table 27: 0 is the element itself; 1-15 are alternative data of a kind no
         // version defines yet, which must not replace it.
-        let element_type = match md.alternate_object_data_id_idx {
+        let element_type = match self.alternate_object_data_id_idx {
             Some(id) if id != 0 => {
                 warn!(
                     "Skipping oa_element {} with reserved alternate data id {id}",
-                    md.oa_element_id_idx
+                    self.oa_element_id_idx
                 );
-                OAElementType::Reserved(md.oa_element_id_idx)
+                return Ok(());
             }
-            _ => OAElementType::from_u8(md.oa_element_id_idx),
+            _ => OAElementType::from_u8(self.oa_element_id_idx),
         };
 
         match element_type {
             // An element type the payload has already given is a duplicate: TS 103 420 tells
             // elements of one type apart only by alternate_object_data_id (table 27), and those
-            // already left with a non-zero one. The first stands, as for the bed object element.
+            // already left with a non-zero one. The first stands.
             OAElementType::Object if state.object_element.is_some() => {
                 warn!("Duplicate object element, keeping the first")
             }
@@ -445,56 +480,35 @@ impl OAElementMD {
             OAElementType::ObjectDescription if state.object_description_element.is_some() => {
                 warn!("Duplicate object description element, keeping the first")
             }
+            OAElementType::BedObject if state.bed_object_element.is_some() => {
+                warn!("Duplicate bed object element, keeping the first")
+            }
             OAElementType::Object => {
-                let object_element = ObjectElement::read(state, reader)?;
-                state.object_element = Some(object_element);
+                state.object_element = Some(ObjectElement::read(state, reader)?);
             }
             OAElementType::Trim => {
-                let trim_element = TrimElement::read(state, reader)?;
-                state.trim_element = Some(trim_element);
+                state.trim_element = Some(TrimElement::read(state, reader)?);
             }
             OAElementType::ExtendObject => {
-                let extended_object_element = ExtendedObjectElement::read(state, reader)?;
-                state.extended_object_element = Some(extended_object_element);
+                state.extended_object_element = Some(ExtendedObjectElement::read(state, reader)?);
             }
             OAElementType::Headphone => {
                 state.headphone_element = Some(HeadphoneElement::read(state, reader)?);
             }
             OAElementType::BedObject => {
-                if state.bed_object_element.is_some() {
-                    warn!("Duplicate bed object element, keeping the first");
-                } else {
-                    match BedObjectElement::read(&state.program_assignment, reader, pos_end) {
-                        Ok(element) => state.bed_object_element = Some(element),
-                        Err(e) => warn!("Skipping malformed bed object element: {e}"),
-                    }
-                }
+                state.bed_object_element =
+                    Some(BedObjectElement::read(&state.program_assignment, reader)?);
             }
             OAElementType::ObjectDescription => {
                 state.object_description_element =
                     Some(ObjectDescriptionElement::read(state, reader)?);
             }
-            _ if md.alternate_object_data_id_idx.is_some_and(|id| id != 0) => {}
-            _ => {
-                warn!(
-                    "Unimplemented oa_element_md type {} with size={oa_element_size}, pos_end={pos_end}, please submit a sample",
-                    md.oa_element_id_idx
-                )
+            OAElementType::Reserved(id) => {
+                warn!("Unimplemented oa_element_md type {id}, please submit a sample")
             }
         }
 
-        // Padding
-        let pos_current = reader.position()?;
-        if pos_end > pos_current {
-            reader.skip_n((pos_end - pos_current) as u32)?;
-        }
-
-        trace!(
-            "OAMD Element ID: {}, size: {}, start: {}, expected_end: {}, actual_end: {}",
-            md.oa_element_id_idx, oa_element_size, pos_start, pos_end, pos_current
-        );
-
-        Ok(md)
+        Ok(())
     }
 }
 
@@ -823,8 +837,8 @@ pub struct ObjectRenderInfo {
     /// the next block's differential position applies to.
     pub pos3d_code: [i32; 3],
     pub b_object_distance_specified: bool,
-    /// Object distance in metres, resolved from [`DISTANCE_FACTORS`] at parse
-    /// time. `None` when unspecified, `f64::INFINITY` for objects at infinity.
+    /// distance_factor, from [`DISTANCE_FACTORS`] at parse time: a ratio to the room boundary, not
+    /// metres. `None` when unspecified, `f64::INFINITY` for objects at infinity.
     pub distance_factor: Option<f64>,
     pub zone_constraints_idx: u8,
     pub b_enable_elevation: bool,
@@ -862,6 +876,11 @@ impl ObjectRenderInfo {
         block_index: usize,
     ) -> Result<Self> {
         let mut render = prev.clone();
+        // obj_render_info[] is numbered in reading order, [0] the first bit read, as table 31 has it
+        // (position [3], the last bit), and as obj_basic_info[] and trim_balance_presence[] are
+        // numbered in their syntax and tables alike. The syntax on p32 numbers it the other way
+        // round. The reading order is the one real payloads parse with: their trim elements read
+        // to within their size with zero padding this way, and not the other.
         let object_render_info_bits = if object_render_info_status_idx == 1 {
             15
         } else {
@@ -953,7 +972,9 @@ impl ObjectRenderInfo {
 
 pub const NUM_TRIM_CONFIGS: usize = 9;
 
-/// Maps a 4-bit distance_factor_idx to object distance in metres.
+/// Maps a 4-bit distance_factor_idx to distance_factor (TS 103 420 table 15): how many times
+/// farther from the room's centre the object is than the room boundary in its direction, a ratio
+/// and not a distance in metres.
 #[rustfmt::skip]
 pub const DISTANCE_FACTORS: [f64; 16] = [
     1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 7.9, 10.0, 12.6, 15.8, 20.0, 25.1, 50.1,
@@ -1184,7 +1205,7 @@ pub struct BedObjectElement {
 }
 
 impl BedObjectElement {
-    fn read(program: &ProgramAssignment, reader: &mut SliceReader, end: u64) -> Result<Self> {
+    fn read(program: &ProgramAssignment, reader: &mut SliceReader) -> Result<Self> {
         let mask = program.bed_assignment.iter().fold(0u32, |mask, bed| {
             bed.0
                 .iter()
@@ -1195,13 +1216,8 @@ impl BedObjectElement {
             presence: [0x300, 0x3000, 0xc00, 0xc0, 0xc000, 0x10008].map(|m| mask & m != 0),
             ..Self::default()
         };
-        let mut read = |n: u32| -> Result<u8> {
-            ensure!(
-                reader.position()? + n as u64 <= end,
-                "bed object field crosses the element boundary"
-            );
-            Ok(reader.get_n::<u8>(n)?)
-        };
+        // The element's own reader ends at its declared size.
+        let mut read = |n: u32| -> Result<u8> { Ok(reader.get_n::<u8>(n)?) };
         element.is_channels = read(1)? != 0;
         if !element.is_channels {
             return Ok(element);
@@ -1397,7 +1413,7 @@ impl ExtendedObjectElement {
             let mut obj_blk = Vec::with_capacity(object_count);
 
             for object_index in 0..object_count {
-                let mut blk_blk = Vec::with_capacity(block_count);
+                let mut blk_blk: Vec<ObjectDivergenceBlock> = Vec::with_capacity(block_count);
 
                 let object_data = &object_element.object_data[object_index];
                 for (block_index, object_info_block) in object_data.iter().enumerate() {
@@ -1418,11 +1434,13 @@ impl ExtendedObjectElement {
                                             [reader.get_n::<u8>(2)? as usize];
                                 }
                                 // Reuse the previous block's value. At block 0 that block is
-                                // the previous payload's last, which only the caller has:
-                                // object_div_mode 1 with no value tells it to carry its own.
+                                // the previous payload's last, which only the caller has, so the
+                                // value here is 0 there and in every block that reuses it in
+                                // turn: a caller that keeps the last value it applied resolves
+                                // object_div_mode 1 from that, at every block.
                                 1 => {
-                                    if let Some(prev_blk) = blk_blk.last().cloned() {
-                                        blk = prev_blk;
+                                    if let Some(prev_blk) = blk_blk.last() {
+                                        blk.object_divergence = prev_blk.object_divergence;
                                     }
                                 }
                                 _ => {
@@ -1863,18 +1881,21 @@ mod tests {
             })
         );
 
-        // No end short of the real one may be read past.
-        for end in 122..143 {
+        // Read from a reader that ends short of the element, it fails rather than reading on.
+        for bytes in 1..3 {
             let mut reader = SliceReader::new(TEST_DATA_BED_OBJECT);
             reader.skip_n(122).unwrap();
-            assert!(BedObjectElement::read(&payload.program_assignment, &mut reader, end).is_err());
-            assert!(reader.position().unwrap() <= end);
+            let body = reader.take(8 * bytes).unwrap();
+            assert!(
+                BedObjectElement::read(&payload.program_assignment, &mut SliceReader::new(&body))
+                    .is_err()
+            );
         }
 
         let mut reader = SliceReader::new(TEST_DATA_BED_OBJECT);
         reader.skip_n(122).unwrap();
         assert_eq!(
-            &BedObjectElement::read(&payload.program_assignment, &mut reader, 143).unwrap(),
+            &BedObjectElement::read(&payload.program_assignment, &mut reader).unwrap(),
             parsed
         );
         assert_eq!(reader.position().unwrap(), 143);
@@ -1906,7 +1927,21 @@ mod tests {
 
     #[test]
     fn trim() -> Result<()> {
-        let _ = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM)?;
+        let payload = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM)?;
+        // trim_balance_presence[] in reading order, [0] the first bit (table 34: [4] centre, [0]
+        // listener-plane balance). Read the other way round it ends 43 bits short of its size,
+        // with 17 of those bits set where only zero padding may be.
+        let trim = payload.trim_element.expect("a trim element");
+        assert_eq!(trim.global_trim_mode, 2);
+        let t = |i: usize| trim.trims[i].clone().unwrap();
+        assert_eq!(
+            (t(0).trim_centre, t(0).trim_surround, t(0).trim_height),
+            (None, Some(-3.0), Some(-4.5))
+        );
+        assert_eq!(
+            (t(1).trim_surround, t(1).bal3d_y_tb, t(1).bal3d_y_lis),
+            (Some(-9.0), Some(1.0), Some(-1.0))
+        );
 
         Ok(())
     }
@@ -2205,6 +2240,81 @@ mod tests {
         assert_eq!(payload.oa_element_md.len(), 2);
         let first = payload.object_element.unwrap();
         assert_eq!(first.object_data[0][0].object_render_info.depth_factor, 2.0);
+        Ok(())
+    }
+
+    /// An element whose fields run past its declared size is dropped, and the element after it is
+    /// read from where that size ends.
+    #[test]
+    fn elements_end_at_their_declared_size() -> Result<()> {
+        let mut object = Bits::default();
+        object_element_header(&mut object, 0, 1);
+        first_block(&mut object, 0, 0, 0, 3);
+        let mut trim = Bits::default();
+        trim.push(2, 1); // warp_mode
+        trim.push(2, 0);
+        trim.push(2, 1); // global_trim_mode: disable
+        trim.push(1, 0); // b_disable_trim_per_obj
+        let mut bits = Bits::default();
+        bits.push(2, 0); // oamd_version
+        bits.push(5, 0); // object_count - 1
+        bits.push(1, 1); // b_dyn_object_only_program
+        bits.push(1, 0); // b_lfe_present
+        bits.push(1, 0); // b_alternate_object_data_present
+        bits.push(4, 2); // oa_element_count
+        // The object element declares a byte less than its fields take.
+        for (id, body, short) in [(1, &object, 1), (2, &trim, 0)] {
+            let bytes = (body.len + 1).div_ceil(8) - short;
+            bits.push(4, id);
+            bits.push(4, (bytes - 1) as u32);
+            bits.push(1, 0);
+            let start = bits.len;
+            bits.push(1, 0); // b_discard_unknown_element
+            for i in 0..body.len.min(8 * bytes - 1) {
+                bits.push(1, ((body.data[i / 8] >> (7 - (i % 8))) & 1) as u32);
+            }
+            while bits.len < start + 8 * bytes {
+                bits.push(1, 0); // padding
+            }
+        }
+        let payload = ObjectAudioMetadataPayload::read(&bits.data)?;
+        assert_eq!(payload.oa_element_md.len(), 2);
+        assert!(payload.object_element.is_none());
+        let trim = payload.trim_element.expect("the element after the bad one");
+        assert_eq!((trim.warp_mode, trim.global_trim_mode), (1, 1));
+        Ok(())
+    }
+
+    /// The last element is read up to the end of the payload, whatever size it declares: nothing
+    /// after it depends on where that size ends.
+    #[test]
+    fn last_element_reads_past_a_short_size() -> Result<()> {
+        let mut object = Bits::default();
+        object_element_header(&mut object, 0, 1);
+        first_block(&mut object, 2, 9, 0, 3);
+        let mut bits = Bits::default();
+        bits.push(2, 0); // oamd_version
+        bits.push(5, 0); // object_count - 1
+        bits.push(1, 1); // b_dyn_object_only_program
+        bits.push(1, 0); // b_lfe_present
+        bits.push(1, 0); // b_alternate_object_data_present
+        bits.push(4, 1); // oa_element_count
+        // The element declares a byte less than its fields take, and all of them follow.
+        let bytes = (object.len + 1).div_ceil(8) - 1;
+        bits.push(4, 1);
+        bits.push(4, (bytes - 1) as u32);
+        bits.push(1, 0);
+        bits.push(1, 0); // b_discard_unknown_element
+        for i in 0..object.len {
+            bits.push(1, ((object.data[i / 8] >> (7 - (i % 8))) & 1) as u32);
+        }
+        let payload = ObjectAudioMetadataPayload::read(&bits.data)?;
+        let block = &payload
+            .object_element
+            .expect("the element, read in full")
+            .object_data[0][0];
+        assert_eq!(block.object_basic_info.object_gain, 6);
+        assert_eq!(block.object_render_info.depth_factor, 2.0);
         Ok(())
     }
 
